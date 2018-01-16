@@ -9,6 +9,7 @@ open System.IO
 open System.Threading.Tasks
 open System.Data.SqlClient
 open System.Reflection
+open System.Text.RegularExpressions
 
 type SqlCommand with
     member this.AsyncExecuteReader behavior =
@@ -174,6 +175,30 @@ let internal findTypeInfoBySqlEngineTypeId (connStr, system_type_id, user_type_i
 let internal findTypeInfoByProviderType( connStr, sqlDbType)  = 
     assert (dataTypeMappings.ContainsKey connStr)
     dataTypeMappings.[connStr] |> Array.find (fun x -> x.SqlDbType = sqlDbType)
+
+let cutStoredProcedureBody code =
+    let blockComments = @"/\*([^\*/])*\*/"
+    let lineComments = @"--(.*?)\r?\n"
+    let afterReplaceBlockComments = Regex.Replace (code, blockComments, " ", RegexOptions.Multiline )
+    let codeWithoutComments = Regex.Replace (afterReplaceBlockComments, lineComments, " " )
+
+    let match_as = Regex.Match(codeWithoutComments, @"\bas\b", RegexOptions.IgnoreCase ||| RegexOptions.Multiline )
+    let match_with = Regex.Match(codeWithoutComments, @"\bwith\b", RegexOptions.IgnoreCase ||| RegexOptions.Multiline )
+    
+    if match_as.Success then
+        let asPosition = match_as.Index
+        
+        if match_with.Success then 
+            let endPosition = 
+                if match_with.Index < asPosition then 
+                    match_with.Index 
+                else 
+                    asPosition 
+            codeWithoutComments.Substring( 0, endPosition ) + " as return 0 "
+        else
+            codeWithoutComments.Substring(0, asPosition ) + " as return 0 "
+    else
+        codeWithoutComments
 
 type LiteralType = Microsoft.SqlServer.TransactSql.ScriptDom.LiteralType
 type UnaryExpression = Microsoft.SqlServer.TransactSql.ScriptDom.UnaryExpression
@@ -404,7 +429,13 @@ type SqlConnection with
         let paramDefaults = Task.Factory.StartNew( fun() ->
 
             let parser = Microsoft.SqlServer.TransactSql.ScriptDom.TSql120Parser( true)
-            let tsqlReader = new StringReader(routine.Definition)
+            let objectCode =
+                if routine.IsStoredProc then 
+                    cutStoredProcedureBody routine.Definition
+                else 
+                    routine.Definition
+
+            let tsqlReader = new StringReader(objectCode)
             let errors = ref Unchecked.defaultof<_>
             let fragment = parser.Parse(tsqlReader, errors)
 
@@ -414,7 +445,7 @@ type SqlConnection with
                 new Microsoft.SqlServer.TransactSql.ScriptDom.TSqlFragmentVisitor() with
                     member __.Visit(node : Microsoft.SqlServer.TransactSql.ScriptDom.ProcedureParameter) = 
                         base.Visit node
-                        result.[node.VariableName.Value] <- parseDefaultValue routine.Definition node.Value
+                        result.[node.VariableName.Value] <- parseDefaultValue objectCode node.Value
             }
 
             result
